@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore", category=Warning)
 class get_CTSS_count():
 
 
-    def __init__(self,out_dir,minCTSSCount,minFC,n_proc,windowSize):
+    def __init__(self,out_dir,minCTSSCount,minFC,n_proc,windowSize,platform='10x',dedup_method='umi',min_mapq=20):
         self.out_dir=out_dir
         generefPath=os.path.join(out_dir,'ref_file','ref_gene.tsv')
         fetched_reads_path=os.path.join(out_dir,'count','fetch_reads.pkl')
@@ -33,6 +33,9 @@ class get_CTSS_count():
         self.minFC=minFC
         self.n_proc=n_proc
         self.windowSize=windowSize
+        self.platform=platform
+        self.dedup_method=dedup_method
+        self.min_mapq=min_mapq
 
 
 

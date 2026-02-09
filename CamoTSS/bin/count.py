@@ -22,6 +22,25 @@ def main():
     parser.add_option('--refFasta','-r',dest='refFasta',default=None,help='The directory for reference genome fasta file') #what should be after $
     parser.add_option('--mode','-m',dest='mode',default=None,help='You can select run by finding novel TSS cluster and CTSS within one cluster [TC+CTSS]. \
                         If you just want to detect TSS cluster, you can use [TC] mode. If you just want to detect CTSS, you can use [CTSS] mode which is based on the output of [TC mode]')
+    
+    # Smart-seq5 specific options
+    parser.add_option('--platform', dest='platform', default='10x', 
+                      choices=['10x', 'smartseq5'], 
+                      help='Sequencing platform: 10x (default) or smartseq5')
+    parser.add_option('--bam_list', dest='bam_list', default=None,
+                      help='File containing list of BAM files for smartseq5 mode (one BAM per line)')
+    parser.add_option('--bam_dir', dest='bam_dir', default=None,
+                      help='Directory containing BAM files for smartseq5 mode (each BAM represents one cell)')
+    parser.add_option('--cell_id_from', dest='cell_id_from', default='filename',
+                      choices=['filename', 'tsv'], 
+                      help='How to determine cell ID for smartseq5: from BAM filename (default) or from TSV mapping')
+    parser.add_option('--cell_map', dest='cell_map', default=None,
+                      help='TSV file mapping sample names to cell IDs for smartseq5 mode')
+    parser.add_option('--dedup', dest='dedup_method', default=None,
+                      choices=['umi', 'coord', 'fragment', 'none'],
+                      help='Deduplication method: umi (for 10x), coord/fragment (for smartseq5), none. Default depends on platform.')
+    parser.add_option('--min_mapq', type="int", dest='min_mapq', default=20,
+                      help='Minimum mapping quality for reads [default: 20]')
 
    
    
@@ -78,31 +97,103 @@ def main():
         print("Error: Need --mode to select the mode what you prefer.")
         sys.exit(1)
 
-    
+    # Determine deduplication method based on platform if not explicitly set
+    if options.dedup_method is None:
+        if options.platform == '10x':
+            options.dedup_method = 'umi'
+        else:  # smartseq5
+            options.dedup_method = 'coord'  # Default for smartseq5
+
     if (options.mode=='TC') or (options.mode=='TC+CTSS'):
-        if options.cdrFile is None:
-            print("Error: Need --cdrFile for cell barcode file.")
-            sys.exit(1)
+        if options.platform == '10x':
+            # Original 10x validation
+            if options.cdrFile is None:
+                print("Error: Need --cdrFile for cell barcode file.")
+                sys.exit(1)
 
-        if options.refFasta is None:
-            print("Error: Need --refFasta for reference fasta file.")
-            sys.exit(1)
+            if options.refFasta is None:
+                print("Error: Need --refFasta for reference fasta file.")
+                sys.exit(1)
 
-        #bam file
-        if options.bam_file is None:
-            print("Error: Need --bam for aligned file.")
-            sys.exit(1)
+            #bam file
+            if options.bam_file is None:
+                print("Error: Need --bam for aligned file.")
+                sys.exit(1)
 
+            #output file
+            if options.out_dir is None:
+                print("Warning: no outDir provided, we use $bamfilePath/CamoTSS\n")
+                out_dir = os.path.dirname(os.path.abspath(options.bam_file)) + "/CamoTSS"
+            else:
+                out_dir = options.out_dir
+            if not os.path.exists(out_dir):
+                os.mkdir(out_dir)
 
-            #output file 
-        if options.out_dir is None:
-            print("Warning: no outDir provided, we use $bamfilePath/CamoTSS\n")
-            out_dir = os.path.dirname(os.path.abspath(options.bam_file)) + "/CamoTSS"
-        else:
-            out_dir = options.out_dir
-        if not os.path.exists(out_dir):
-            os.mkdir(out_dir)
+            bam_file = options.bam_file  # Single BAM file for 10x
 
+        elif options.platform == 'smartseq5':
+            # Smart-seq5 validation
+            if options.refFasta is None:
+                print("Error: Need --refFasta for reference fasta file.")
+                sys.exit(1)
+
+            # Either bam_list or bam_dir must be provided for smartseq5
+            if options.bam_list is None and options.bam_dir is None:
+                print("Error: For smartseq5 platform, need either --bam_list or --bam_dir")
+                sys.exit(1)
+
+            # If using cell_map, validate it exists
+            if options.cell_id_from == 'tsv' and options.cell_map is None:
+                print("Error: For smartseq5 with --cell_id_from tsv, need --cell_map")
+                sys.exit(1)
+
+            #output file
+            if options.out_dir is None:
+                print("Warning: no outDir provided, using ./CamoTSS_smartseq5/\n")
+                out_dir = "./CamoTSS_smartseq5"
+            else:
+                out_dir = options.out_dir
+            if not os.path.exists(out_dir):
+                os.mkdir(out_dir)
+
+            # Process BAM files for smartseq5
+            bam_files = []
+            if options.bam_list:
+                with open(options.bam_list, 'r') as f:
+                    bam_files = [line.strip() for line in f if line.strip()]
+            elif options.bam_dir:
+                import glob
+                bam_files = glob.glob(os.path.join(options.bam_dir, "*.bam")) + \
+                           glob.glob(os.path.join(options.bam_dir, "*.sam"))
+            
+            print(f"[CamoTSS] Found {len(bam_files)} BAM files for smartseq5 analysis")
+            if len(bam_files) == 0:
+                print("Error: No BAM files found for smartseq5 analysis")
+                sys.exit(1)
+
+            # Create cell barcode list from BAM files or mapping
+            if options.cell_id_from == 'filename':
+                cell_barcodes = [os.path.splitext(os.path.basename(bam))[0] for bam in bam_files]
+            elif options.cell_id_from == 'tsv':
+                cell_map_df = pd.read_csv(options.cell_map, sep='\t')
+                # Map sample names (BAM basenames) to cell IDs
+                bam_basenames = [os.path.splitext(os.path.basename(bam))[0] for bam in bam_files]
+                cell_barcodes = []
+                for basename in bam_basenames:
+                    matching_cell = cell_map_df[cell_map_df.iloc[:, 0] == basename]
+                    if len(matching_cell) > 0:
+                        cell_barcodes.append(matching_cell.iloc[0, 1])
+                    else:
+                        cell_barcodes.append(basename)  # fallback to filename if not in mapping
+
+            # Create temporary cell barcode file
+            temp_cell_file = os.path.join(out_dir, "temp_smartseq5_cells.tsv")
+            temp_cell_df = pd.DataFrame({"cell_id": cell_barcodes})
+            temp_cell_df.to_csv(temp_cell_file, sep='\t', index=False)
+            options.cdrFile = temp_cell_file  # Override for downstream processing
+
+            # For smartseq5, we'll pass the list of BAM files differently
+            bam_file = bam_files  # List of BAM files for smartseq5
 
         #gtf file
         if options.gtf_file is None:
@@ -127,17 +218,20 @@ def main():
         out_dir=options.out_dir
 
 
-    bam_file=options.bam_file
-    minCount=options.minCount
-    cellBarcodePath=options.cdrFile
-    n_proc=options.nproc
-    maxReadCount=options.maxReadCount
-    clusterDistance=options.clusterDistance
-    InnerDistance=options.InnerDistance
-    fastqFilePath=options.refFasta
-    windowSize=options.windowSize
-    minCTSSCount=options.minCTSSCount
-    minFC=options.minFC
+    bam_file = bam_file  # Already set based on platform above
+    minCount = options.minCount
+    cellBarcodePath = options.cdrFile
+    n_proc = options.nproc
+    maxReadCount = options.maxReadCount
+    clusterDistance = options.clusterDistance
+    InnerDistance = options.InnerDistance
+    fastqFilePath = options.refFasta
+    windowSize = options.windowSize
+    minCTSSCount = options.minCTSSCount
+    minFC = options.minFC
+    platform = options.platform
+    dedup_method = options.dedup_method
+    min_mapq = options.min_mapq
     
 
 
@@ -145,20 +239,20 @@ def main():
 
         
     if options.mode == "TC":
-        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC)
+        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq)
         scadata=getTSScount.produce_sclevel()
 
     elif options.mode=="TC+CTSS":
         # ctss_out_dir=str(options.out_dir)+'/CTSS/'
         # if not os.path.exists(ctss_out_dir):
         #     os.mkdir(ctss_out_dir)
-        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC)
+        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq)
         scadata=getTSScount.produce_sclevel()
         twoctssadata=getTSScount.produce_CTSS_adata()
 
 
     elif options.mode=='CTSS':
-        getctsscount=get_CTSS_count(out_dir,minCTSSCount,minFC,n_proc,windowSize)   # should create CTSS 
+        getctsscount=get_CTSS_count(out_dir,minCTSSCount,minFC,n_proc,windowSize,platform,dedup_method,min_mapq)   # should create CTSS
         ctssadata=getctsscount.produce_CTSS_adata()
 
 

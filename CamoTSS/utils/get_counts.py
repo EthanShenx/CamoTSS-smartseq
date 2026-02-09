@@ -38,7 +38,7 @@ class get_TSS_count():
 
 
 
-    def __init__(self,generefPath,tssrefPath,bamfilePath,fastqFilePath,outdir,cellBarcodePath,nproc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC):
+    def __init__(self,generefPath,tssrefPath,bamfilePath,fastqFilePath,outdir,cellBarcodePath,nproc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform='10x',dedup_method='umi',min_mapq=20):
         self.generefdf=pd.read_csv(generefPath,delimiter='\t')
         #self.generefdf.set_index('gene_id',inplace=True)
         self.generefdf['len']=self.generefdf['End']-self.generefdf['Start']
@@ -62,6 +62,15 @@ class get_TSS_count():
         self.windowSize=windowSize
         self.minCTSSCount=minCTSSCount
         self.minFC=minFC
+        self.platform=platform
+        self.dedup_method=dedup_method
+        self.min_mapq=min_mapq
+        
+        # Handle smartseq5 case where bamfilePath is a list of files
+        if isinstance(bamfilePath, list):
+            self.bam_file_list = bamfilePath
+        else:
+            self.bam_file_list = [bamfilePath]
 
         
 
@@ -136,67 +145,136 @@ class get_TSS_count():
 
         
     def _get_gene_reads(self):
+        if self.platform == '10x':
+            # Original 10x processing
+            pool = multiprocessing.Pool(processes=self.nproc)
 
-        pool = multiprocessing.Pool(processes=self.nproc)
+            bamfilePath = self.bamfilePath
+            fastqFilePath = self.fastqFilePath
 
+            getreadsFile = pysam.AlignmentFile(bamfilePath, 'rb')
 
-        bamfilePath=self.bamfilePath
-        fastqFilePath=self.fastqFilePath
+            geneidls = []
+            for read in getreadsFile.fetch(until_eof=True):
+                geneid = read.get_tag('GX')
+                geneidls.append(geneid)
+            geneiddf = pd.DataFrame(geneidls, columns=['gene_id'])
+            print("hi , this is the gene id df ")
 
+            geneid_uniqdf = geneiddf.drop_duplicates('gene_id')
+            print(geneiddf)
+            print("hi, this is the gene refdf")
+            print(self.generefdf)
 
-        getreadsFile=pysam.AlignmentFile(bamfilePath,'rb')
+            mergedf = geneid_uniqdf.merge(self.generefdf, on='gene_id')
+            mergedf.set_index('gene_id', inplace=True)
+            print("hi, this is the merge df")
+            print(mergedf)
+            # print(self.generefdf)
 
-        geneidls=[]
-        for read in getreadsFile.fetch(until_eof = True):
-            geneid=read.get_tag('GX')
-            geneidls.append(geneid)
-        geneiddf=pd.DataFrame(geneidls,columns=['gene_id'])
-        print("hi , this is the gene id df ")
-    
-        geneid_uniqdf=geneiddf.drop_duplicates('gene_id')
-        print(geneiddf)
-        print("hi, this is the gene refdf")
-        print(self.generefdf)
+            readinfodict = {}
+            results = []
 
+            #get reads because pysam object cannot be used for multiprocessing so inputting bam file path
+            for i in mergedf.index:
+                print(i)
+                results.append(pool.apply_async(self._getreads, (bamfilePath, fastqFilePath, i, mergedf)))
+            pool.close()
+            pool.join()
+            results = [res.get() for res in results]
 
-        mergedf=geneid_uniqdf.merge(self.generefdf,on='gene_id')
-        mergedf.set_index('gene_id',inplace=True)
-        print("hi, this is the merge df")
-        print(mergedf)
-        # print(self.generefdf)
+            print('Hello, we finished to get the reads')
 
+            for geneid, resls in zip(mergedf.index, results):
+                readinfodict[geneid] = resls
 
+        elif self.platform == 'smartseq5':
+            # Smart-seq5 processing: process each BAM file separately
+            pool = multiprocessing.Pool(processes=self.nproc)
+            
+            fastqFilePath = self.fastqFilePath
+            
+            # Collect all genes across all BAM files
+            geneidls = []
+            for bam_file in self.bam_file_list:
+                getreadsFile = pysam.AlignmentFile(bam_file, 'rb')
+                for read in getreadsFile.fetch(until_eof=True):
+                    if read.has_tag('GX'):  # Assuming GX tag exists in smart-seq5 data
+                        geneid = read.get_tag('GX')
+                        geneidls.append(geneid)
+                getreadsFile.close()
+            
+            geneiddf = pd.DataFrame(geneidls, columns=['gene_id'])
+            print("hi , this is the gene id df from smartseq5")
 
-        readinfodict={}
-        results=[]
+            geneid_uniqdf = geneiddf.drop_duplicates('gene_id')
+            print(geneiddf)
+            print("hi, this is the gene refdf")
+            print(self.generefdf)
 
-        #get reads because pysam object cannot be used for multiprocessing so inputting bam file path 
-        for i in mergedf.index:
-            print(i)
-            results.append(pool.apply_async(self._getreads,(bamfilePath,fastqFilePath,i,mergedf)))
-        pool.close()
-        pool.join()
-        results=[res.get() for res in results]
+            mergedf = geneid_uniqdf.merge(self.generefdf, on='gene_id')
+            mergedf.set_index('gene_id', inplace=True)
+            print("hi, this is the merge df")
+            print(mergedf)
 
-        print('Hello, we finished to get the reads')
-
-        for geneid,resls in zip(mergedf.index,results):
-            readinfodict[geneid]=resls  
-
+            readinfodict = {}
+            
+            # Process each gene across all BAM files
+            for geneid in mergedf.index:
+                print(f"Processing gene: {geneid}")
+                
+                # Collect reads for this gene from all BAM files
+                all_gene_reads = []
+                for bam_idx, bam_file in enumerate(self.bam_file_list):
+                    cell_id = os.path.splitext(os.path.basename(bam_file))[0]  # Use BAM filename as cell ID
+                    
+                    # Get reads for this gene from this specific BAM file
+                    samFile, _chrom = check_pysam_chrom(bam_file, str(mergedf.loc[geneid]['Chromosome']))
+                    
+                    # Fetch reads in gene region
+                    reads = fetch_reads(samFile, _chrom, 
+                                      mergedf.loc[geneid]['Start'], 
+                                      mergedf.loc[geneid]['End'], 
+                                      trimLen_max=100, 
+                                      mapq_min=self.min_mapq)
+                    reads1 = reads["reads1"]
+                    
+                    # Filter reads based on gene tag and cell barcode
+                    reads1 = [r for r in reads1 if r.has_tag('GX') and r.get_tag('GX') == geneid]
+                    
+                    # Apply deduplication based on method
+                    if self.dedup_method == 'umi':
+                        # Original UMI-based deduplication
+                        reads1 = self._deduplicate_by_umi(reads1, mergedf, geneid)
+                    elif self.dedup_method in ['coord', 'fragment']:
+                        # Coordinate or fragment-based deduplication for smart-seq5
+                        reads1 = self._deduplicate_by_coordinates(reads1, mergedf, geneid, self.dedup_method)
+                    elif self.dedup_method == 'none':
+                        # No deduplication
+                        pass
+                    
+                    # Convert to the format expected by downstream functions
+                    for r in reads1:
+                        if mergedf.loc[geneid]['Strand'] == '+':
+                            pos = r.reference_start
+                        else:  # '-'
+                            pos = r.reference_end
+                        all_gene_reads.append((pos, cell_id, r.cigarstring))
+                
+                readinfodict[geneid] = all_gene_reads
 
         #delete gene whose reads length is larger than maxReadCount
         for i in list(readinfodict.keys()):
-            if len(readinfodict[i])>self.maxReadCount:
-                readinfodict[i]=random.sample(readinfodict[i],self.maxReadCount)
-            if len(readinfodict[i])<2:
-                del readinfodict[i] 
+            if len(readinfodict[i]) > self.maxReadCount:
+                readinfodict[i] = random.sample(readinfodict[i], self.maxReadCount)
+            if len(readinfodict[i]) < 2:
+                del readinfodict[i]
 
         #print('hello,we finish get readinfodict')
         #store reads fetched
-        outfilename=self.count_out_dir+'fetch_reads.pkl'
-        with open(outfilename,'wb') as f:
-            pickle.dump(readinfodict,f)
-
+        outfilename = self.count_out_dir + 'fetch_reads.pkl'
+        with open(outfilename, 'wb') as f:
+            pickle.dump(readinfodict, f)
 
         return readinfodict
 
@@ -727,4 +805,82 @@ class get_TSS_count():
         return twoctssadata
 
 
+
+
+    def _deduplicate_by_umi(self, reads, mergedf, geneid):
+        """Original UMI-based deduplication for 10x data"""
+        if not reads:
+            return reads
+            
+        # Apply strand-specific filtering similar to original
+        if mergedf.loc[geneid]['Strand'] == '+':
+            reads = [r for r in reads if not r.is_reverse]
+            readsdf = pd.DataFrame({
+                'name': [r.query_name for r in reads],
+                'TSS': [r.reference_start for r in reads],
+                'UMI': [r.get_tag('UB') if r.has_tag('UB') else 'unknown' for r in reads],
+                'CB': [r.get_tag('CB') if r.has_tag('CB') else 'unknown' for r in reads]
+            })
+            readsdf.sort_values(['UMI', 'CB', 'TSS'], inplace=True)
+            groups = readsdf.groupby(['UMI', 'CB']).head(1)
+            reads = [r for r in reads if r.query_name in groups['name'].tolist()]
+        else:  # '-'
+            reads = [r for r in reads if r.is_reverse]
+            readsdf = pd.DataFrame({
+                'name': [r.query_name for r in reads],
+                'TSS': [r.reference_end for r in reads],
+                'UMI': [r.get_tag('UB') if r.has_tag('UB') else 'unknown' for r in reads],
+                'CB': [r.get_tag('CB') if r.has_tag('CB') else 'unknown' for r in reads]
+            })
+            readsdf.sort_values(['UMI', 'CB', 'TSS'], inplace=True)
+            groups = readsdf.groupby(['UMI', 'CB']).tail(1)
+            reads = [r for r in reads if r.query_name in groups['name'].tolist()]
+        
+        return reads
+
+
+    def _deduplicate_by_coordinates(self, reads, mergedf, geneid, dedup_method):
+        """Coordinate or fragment-based deduplication for smart-seq5 data"""
+        if not reads:
+            return reads
+            
+        seen_keys = set()
+        deduplicated_reads = []
+        
+        for r in reads:
+            # Skip invalid reads
+            if r.is_unmapped or r.is_secondary or r.is_duplicate or r.is_supplementary:
+                continue
+                
+            if r.mapping_quality < self.min_mapq:
+                continue
+                
+            # Calculate 5' position
+            if r.is_reverse:  # Negative strand
+                five_prime_pos = r.reference_end - 1  # 0-based end position
+            else:  # Positive strand
+                five_prime_pos = r.reference_start  # 0-based start position
+                
+            if dedup_method == 'coord':
+                # Single-end coordinate deduplication key: (chrom, five_prime_pos, strand)
+                dedup_key = (r.reference_name, five_prime_pos, r.is_reverse)
+            elif dedup_method == 'fragment':
+                # Fragment-based deduplication key: (chrom, fragment_start, fragment_end, strand)
+                # For single-end reads, fragment boundaries are estimated
+                if r.is_reverse:
+                    frag_start = r.reference_end - 500  # Estimate fragment start (500bp upstream)
+                    frag_end = r.reference_end
+                else:
+                    frag_start = r.reference_start
+                    frag_end = r.reference_start + 500  # Estimate fragment end (500bp downstream)
+                dedup_key = (r.reference_name, frag_start, frag_end, r.is_reverse)
+            else:
+                # Fallback to coordinate deduplication
+                dedup_key = (r.reference_name, five_prime_pos, r.is_reverse)
+                
+            if dedup_key not in seen_keys:
+                seen_keys.add(dedup_key)
+                deduplicated_reads.append(r)
+                
+        return deduplicated_reads
 
