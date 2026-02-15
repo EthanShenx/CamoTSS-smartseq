@@ -3,10 +3,24 @@ import pyranges as pr
 import numpy as np
 from functools import reduce 
 
+def _normalize_chrom_series(chrom: pd.Series) -> pd.Series:
+    """Normalize contig names so both UCSC-style (chr1) and Ensembl-style (1) GTFs work.
+
+    We store chromosomes without the leading 'chr' when present. Downstream read fetching
+    uses check_pysam_chrom() to resolve either naming convention against the BAM header.
+    """
+    chrom = chrom.copy()
+    chrom = chrom.where(~chrom.isna(), other=np.nan)
+    chrom = chrom.astype(str)
+    chrom = chrom.str.replace(r'^chr', '', regex=True)
+    # astype(str) turns NaN into 'nan' string; convert that back to NaN.
+    chrom = chrom.replace('nan', np.nan)
+    return chrom
+
 def get_TSSref(grdf,out_dir):
     tssdf=grdf[grdf['Feature']=='transcript']
     tssdf=tssdf[['transcript_id','gene_id','gene_name','Chromosome','Start','End','Strand']]
-    tssdf['Chromosome']=tssdf['Chromosome'].str.split('chr',expand=True)[1]
+    tssdf['Chromosome']=_normalize_chrom_series(tssdf['Chromosome'])
 
 
     #consider positive and negative strand questions
@@ -25,7 +39,7 @@ def get_generef(grdf,tssdf,out_dir):
     genedf=grdf[grdf['Feature']=='gene']
     genedf=genedf[['Chromosome','Feature','Start','End','Strand','gene_id','gene_name']]
 
-    genedf['Chromosome']=genedf['Chromosome'].str.split('chr',expand=True)[1]
+    genedf['Chromosome']=_normalize_chrom_series(genedf['Chromosome'])
     genedf=genedf[genedf['gene_id'].isin(pd.unique(tssdf['gene_id']))]
     genedf.dropna(subset=['Chromosome'],axis=0,inplace=True)
 
