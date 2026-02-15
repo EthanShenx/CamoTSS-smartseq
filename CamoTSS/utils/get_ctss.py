@@ -43,7 +43,12 @@ class get_CTSS_count():
 
 
         leftIndex=0
-        filterls=[i for i in genereads if ('14S' in i[2]) or ('15S' in i[2]) or ('16S' in i[2])  ]
+        # In 10x 5' libraries we can use unencoded-G related soft-clips to denoise.
+        # Smart-seq+5' libraries do not have this signature; use all reads.
+        if self.platform == '10x':
+            filterls=[i for i in genereads if ('14S' in i[2]) or ('15S' in i[2]) or ('16S' in i[2])]
+        else:
+            filterls=list(genereads)
         #print("the pid of current process：",os.getpid())
         
         #calculate the TSS position and corresponding counts

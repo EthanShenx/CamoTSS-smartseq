@@ -44,7 +44,7 @@ class get_TSS_count():
 
 
 
-    def __init__(self,generefPath,tssrefPath,bamfilePath,fastqFilePath,outdir,cellBarcodePath,nproc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform='10x',dedup_method='umi',min_mapq=20,tss_read=None):
+    def __init__(self,generefPath,tssrefPath,bamfilePath,fastqFilePath,outdir,cellBarcodePath,nproc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform='10x',dedup_method='umi',min_mapq=20,tss_read=None,gene_assign=None,promoter_window=500,filter_model=None):
         self.generefdf=pd.read_csv(generefPath,delimiter='\t')
         #self.generefdf.set_index('gene_id',inplace=True)
         self.generefdf['len']=self.generefdf['End']-self.generefdf['Start']
@@ -79,6 +79,21 @@ class get_TSS_count():
         if tss_read not in ('read1', 'read2'):
             raise ValueError(f"Invalid tss_read: {tss_read}. Expected 'read1' or 'read2'.")
         self.tss_read=tss_read
+
+        # Smart-seq+5' libraries typically do not have CellRanger-style GX/GN tags.
+        if gene_assign is None:
+            gene_assign = 'GX' if platform == '10x' else 'overlap'
+        if gene_assign not in ('GX', 'overlap'):
+            raise ValueError(f"Invalid gene_assign: {gene_assign}. Expected 'GX' or 'overlap'.")
+        self.gene_assign = gene_assign
+        self.promoter_window = int(promoter_window) if promoter_window is not None else 0
+
+        # The bundled logistic model is trained on 10x-style 5' libraries; default to no model for smartseq5.
+        if filter_model is None:
+            filter_model = 'logistic' if platform == '10x' else 'none'
+        if filter_model not in ('logistic', 'none'):
+            raise ValueError(f"Invalid filter_model: {filter_model}. Expected 'logistic' or 'none'.")
+        self.filter_model = filter_model
         
         # Handle smartseq5 case where bamfilePath is a list of files
         if isinstance(bamfilePath, list):
@@ -95,12 +110,21 @@ class get_TSS_count():
         if NCLS is None:
             raise RuntimeError("ncls is required for gene assignment fallback but is not available.")
 
-        df = self.generefdf[['gene_id', 'Chromosome', 'Start', 'End']].copy()
+        df = self.generefdf[['gene_id', 'Chromosome', 'Start', 'End', 'Strand']].copy()
         df = df.dropna(subset=['Chromosome'])
         # Gene refs are stored without leading 'chr' (see build_ref.py), but be defensive.
         df['Chromosome'] = df['Chromosome'].astype(str).str.replace(r'^chr', '', regex=True)
         df['Start'] = df['Start'].astype(int)
         df['End'] = df['End'].astype(int)
+        df['Strand'] = df['Strand'].astype(str)
+
+        # Extend gene intervals towards promoter direction (tolerate slight upstream shifts).
+        if getattr(self, 'promoter_window', 0) and self.promoter_window > 0:
+            w = int(self.promoter_window)
+            plus = df['Strand'] == '+'
+            minus = df['Strand'] == '-'
+            df.loc[plus, 'Start'] = (df.loc[plus, 'Start'] - w).clip(lower=0)
+            df.loc[minus, 'End'] = df.loc[minus, 'End'] + w
 
         idx = {}
         meta = {}
@@ -267,9 +291,8 @@ class get_TSS_count():
             # Smart-seq5 processing: process each BAM file separately
             fastqFilePath = self.fastqFilePath
 
-            # If GX tag exists, use it to discover expressed genes. Otherwise, fall back to
-            # overlap-based assignment using gene intervals from the GTF.
-            has_gx = any(self._has_gene_tag(b) for b in self.bam_file_list)
+            # Smart-seq+5' typically lacks GX/GN tags; default to overlap assignment.
+            has_gx = (self.gene_assign == 'GX') and any(self._has_gene_tag(b) for b in self.bam_file_list)
 
             if has_gx:
                 geneidls = []
@@ -538,17 +561,20 @@ class get_TSS_count():
 
         # print(Path(os.path.dirname(os.path.abspath(__file__))).parents[1])
 
-        pathstr=str(Path(os.path.dirname(os.path.abspath(__file__))).parents[0])+'/model/logistic_4feature_model.sav'
-        loaded_model = pickle.load(open(pathstr, 'rb'))
-        test_Y=loaded_model.predict(test_X.values)
-
-        #do filtering, the result of this step should be output as final h5ad file display at single cell level. 
-        afterfiltereddf=fourfeaturedf[test_Y==1]
-        if afterfiltereddf.shape[0] == 0:
-            # The pre-trained classifier can be too strict for non-10x libraries (e.g. Smart-seq+5').
-            # Fall back to keeping all clusters that passed the basic minCount threshold.
-            print("[CamoTSS] Warning: classifier filtered out all TSS clusters; falling back to keep all clusters.")
+        if self.filter_model == 'none':
             afterfiltereddf = fourfeaturedf.copy()
+        else:
+            pathstr=str(Path(os.path.dirname(os.path.abspath(__file__))).parents[0])+'/model/logistic_4feature_model.sav'
+            loaded_model = pickle.load(open(pathstr, 'rb'))
+            test_Y=loaded_model.predict(test_X.values)
+
+            #do filtering, the result of this step should be output as final h5ad file display at single cell level. 
+            afterfiltereddf=fourfeaturedf[test_Y==1]
+            if afterfiltereddf.shape[0] == 0:
+                # The pre-trained classifier can be too strict for non-10x libraries (e.g. Smart-seq+5').
+                # Fall back to keeping all clusters that passed the basic minCount threshold.
+                print("[CamoTSS] Warning: classifier filtered out all TSS clusters; falling back to keep all clusters.")
+                afterfiltereddf = fourfeaturedf.copy()
         afterfiltereddf.columns=['UMI_count','SD','summit_UMI_count','unencoded_G_percent','NO.TSS','gene_id','summit_position']
 
         afterfilter_output=self.count_out_dir+'afterfiltered.csv'
@@ -756,11 +782,12 @@ class get_TSS_count():
 
         leftIndex=0
 
-        # do filtering; drop reads which does not include unencoded G
-        filterls=[]
-        for i in genereads:
-            if ('14S' in i[2]) or ('15S' in i[2]) or ('16S' in i[2]):
-                filterls.append(i)
+        # In 10x 5' libraries we can use unencoded-G related soft-clips to denoise.
+        # Smart-seq+5' libraries do not have this signature; use all reads.
+        if self.platform == '10x':
+            filterls=[i for i in genereads if ('14S' in i[2]) or ('15S' in i[2]) or ('16S' in i[2])]
+        else:
+            filterls=list(genereads)
 
 
         #calculate the TSS position and corresponding counts

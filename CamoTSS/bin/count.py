@@ -45,6 +45,17 @@ def main():
                       choices=['read1', 'read2'],
                       help="Which mate contains the 5' transcript sequence used for TSS calling. "
                            "Default: read1 for 10x, read2 for smartseq5.")
+    parser.add_option('--gene_assign', dest='gene_assign', default=None,
+                      choices=['GX', 'overlap'],
+                      help="How to assign reads to genes. 'GX' uses BAM tags (CellRanger-style). "
+                           "'overlap' assigns by genomic overlap to GTF gene intervals (Smart-seq+5' default).")
+    parser.add_option('--promoter_window', type="int", dest='promoter_window', default=500,
+                      help="Extra bp to extend gene intervals upstream of TSS direction when using --gene_assign overlap "
+                           "[default: 500].")
+    parser.add_option('--filter_model', dest='filter_model', default=None,
+                      choices=['logistic', 'none'],
+                      help="Model used to filter TSS clusters after basic thresholds. "
+                           "Default: logistic for 10x, none for smartseq5.")
 
    
    
@@ -111,6 +122,14 @@ def main():
     # Determine which read carries the 5' transcript information
     if options.tss_read is None:
         options.tss_read = 'read1' if options.platform == '10x' else 'read2'
+    
+    # Determine gene assignment strategy
+    if options.gene_assign is None:
+        options.gene_assign = 'GX' if options.platform == '10x' else 'overlap'
+    
+    # Determine filtering model
+    if options.filter_model is None:
+        options.filter_model = 'logistic' if options.platform == '10x' else 'none'
 
     if (options.mode=='TC') or (options.mode=='TC+CTSS'):
         if options.platform == '10x':
@@ -247,14 +266,14 @@ def main():
 
         
     if options.mode == "TC":
-        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq,options.tss_read)
+        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq,options.tss_read,options.gene_assign,options.promoter_window,options.filter_model)
         scadata=getTSScount.produce_sclevel()
 
     elif options.mode=="TC+CTSS":
         # ctss_out_dir=str(options.out_dir)+'/CTSS/'
         # if not os.path.exists(ctss_out_dir):
         #     os.mkdir(ctss_out_dir)
-        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq,options.tss_read)
+        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq,options.tss_read,options.gene_assign,options.promoter_window,options.filter_model)
         scadata=getTSScount.produce_sclevel()
         twoctssadata=getTSScount.produce_CTSS_adata()
 
@@ -269,4 +288,3 @@ def main():
         run_time = time.time() - START_TIME
         print("[CamoTSS] All done: %d min %.1f sec" %(int(run_time / 60), 
                                                   run_time % 60))
-
