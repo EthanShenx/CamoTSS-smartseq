@@ -12,6 +12,7 @@ This implementation adds Smart-seq5 support to the CamoTSS tool while maintainin
 - Added `--cell_map` for custom cell ID mapping
 - Added `--dedup {umi,coord,fragment,none}` with platform-dependent defaults
 - Added `--min_mapq` for mapping quality filtering
+- Added `--tss_read {read1,read2}` to select which mate contains 5' transcript information for TSS calling
 
 ### 2. Core Logic Updates (`CamoTSS/utils/get_counts.py`)
 - Updated `get_TSS_count` class to accept new parameters

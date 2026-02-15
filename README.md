@@ -93,6 +93,7 @@ CamoTSS --platform smartseq5 --gtf $gtfFile --refFasta $fastaFile --bam_list $ba
 * `--cell_map <cells.tsv>` - TSV file mapping sample names to cell IDs for smartseq5 mode
 * `--dedup {umi,coord,fragment,none}` - Deduplication method: umi (for 10x), coord/fragment (for smartseq5), none. Default depends on platform.
 * `--min_mapq <int>` - Minimum mapping quality for reads (default: 20)
+* `--tss_read {read1,read2}` - Which mate contains the 5' transcript sequence used for TSS calling. Default: read1 for 10x, read2 for smartseq5.
 
 **Note**
 You should use the same reference gtf file and reference fasta file as that you used during alignment. In other words, if you run alignment by using cellranger, then the gtf file and fasta file should located in the refdata-gex-GRCh38-2020-A/fasta/genome.fa and refdata-gex-GRCh38-2020-A/genes/genes.gtf.

@@ -43,6 +43,7 @@ echo "4. Run CamoTSS with coordinate-based deduplication (recommended for Smart-
 echo "   CamoTSS --platform smartseq5 --gtf /path/to/annotation.gtf \\"
 echo "           --refFasta /path/to/reference.fasta \\"
 echo "           --bam_dir /path/to/bam/files/ \\"
+echo "           --tss_read read2 \\"
 echo "           --dedup coord \\"
 echo "           --min_mapq 30 \\"
 echo "           -o ./output_smartseq5 \\"

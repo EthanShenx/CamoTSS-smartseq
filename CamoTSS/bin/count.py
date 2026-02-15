@@ -41,6 +41,10 @@ def main():
                       help='Deduplication method: umi (for 10x), coord/fragment (for smartseq5), none. Default depends on platform.')
     parser.add_option('--min_mapq', type="int", dest='min_mapq', default=20,
                       help='Minimum mapping quality for reads [default: 20]')
+    parser.add_option('--tss_read', dest='tss_read', default=None,
+                      choices=['read1', 'read2'],
+                      help="Which mate contains the 5' transcript sequence used for TSS calling. "
+                           "Default: read1 for 10x, read2 for smartseq5.")
 
    
    
@@ -103,6 +107,10 @@ def main():
             options.dedup_method = 'umi'
         else:  # smartseq5
             options.dedup_method = 'coord'  # Default for smartseq5
+    
+    # Determine which read carries the 5' transcript information
+    if options.tss_read is None:
+        options.tss_read = 'read1' if options.platform == '10x' else 'read2'
 
     if (options.mode=='TC') or (options.mode=='TC+CTSS'):
         if options.platform == '10x':
@@ -239,14 +247,14 @@ def main():
 
         
     if options.mode == "TC":
-        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq)
+        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq,options.tss_read)
         scadata=getTSScount.produce_sclevel()
 
     elif options.mode=="TC+CTSS":
         # ctss_out_dir=str(options.out_dir)+'/CTSS/'
         # if not os.path.exists(ctss_out_dir):
         #     os.mkdir(ctss_out_dir)
-        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq)
+        getTSScount=get_TSS_count(generefpath,tssrefpath,bam_file,fastqFilePath,out_dir,cellBarcodePath,n_proc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform,dedup_method,min_mapq,options.tss_read)
         scadata=getTSScount.produce_sclevel()
         twoctssadata=getTSScount.produce_CTSS_adata()
 
@@ -261,5 +269,4 @@ def main():
         run_time = time.time() - START_TIME
         print("[CamoTSS] All done: %d min %.1f sec" %(int(run_time / 60), 
                                                   run_time % 60))
-
 

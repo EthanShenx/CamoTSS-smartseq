@@ -117,6 +117,7 @@ Alternatively, you can provide a list of BAM files:
 * ``--cell_map <cells.tsv>`` - TSV file mapping sample names to cell IDs for smartseq5 mode
 * ``--dedup {umi,coord,fragment,none}`` - Deduplication method: umi (for 10x), coord/fragment (for smartseq5), none. Default depends on platform.
 * ``--min_mapq <int>`` - Minimum mapping quality for reads (default: 20)
+* ``--tss_read {read1,read2}`` - Which mate contains the 5' transcript sequence used for TSS calling. Default: read1 for 10x, read2 for smartseq5.
 
 
 Alternative TSS or CTSS detecting
@@ -156,7 +157,6 @@ Reference
 ===========
 
 Hou, R., Hon, CC. & Huang, Y. CamoTSS: analysis of alternative transcription start sites for cellular phenotypes and regulatory patterns from 5' scRNA-seq data. Nat Commun 14, 7240 (2023). https://doi.org/10.1038/s41467-023-42636-1
-
 
 
 

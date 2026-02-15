@@ -38,7 +38,7 @@ class get_TSS_count():
 
 
 
-    def __init__(self,generefPath,tssrefPath,bamfilePath,fastqFilePath,outdir,cellBarcodePath,nproc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform='10x',dedup_method='umi',min_mapq=20):
+    def __init__(self,generefPath,tssrefPath,bamfilePath,fastqFilePath,outdir,cellBarcodePath,nproc,minCount,maxReadCount,clusterDistance,InnerDistance,windowSize,minCTSSCount,minFC,platform='10x',dedup_method='umi',min_mapq=20,tss_read=None):
         self.generefdf=pd.read_csv(generefPath,delimiter='\t')
         #self.generefdf.set_index('gene_id',inplace=True)
         self.generefdf['len']=self.generefdf['End']-self.generefdf['Start']
@@ -65,6 +65,14 @@ class get_TSS_count():
         self.platform=platform
         self.dedup_method=dedup_method
         self.min_mapq=min_mapq
+        # Which mate contains the 5' transcript information used for TSS calling.
+        # For 10x 5' scRNA-seq, read1 (often sequenced long) is expected.
+        # For Smart-seq5 data, read2 is often the 5' informative read.
+        if tss_read is None:
+            tss_read = 'read1' if platform == '10x' else 'read2'
+        if tss_read not in ('read1', 'read2'):
+            raise ValueError(f"Invalid tss_read: {tss_read}. Expected 'read1' or 'read2'.")
+        self.tss_read=tss_read
         
         # Handle smartseq5 case where bamfilePath is a list of files
         if isinstance(bamfilePath, list):
@@ -237,7 +245,12 @@ class get_TSS_count():
                                       mergedf.loc[geneid]['End'], 
                                       trimLen_max=100, 
                                       mapq_min=self.min_mapq)
-                    reads1 = reads["reads1"]
+                    # Select the mate that carries 5' transcript information.
+                    # Include both mated and unmated reads so single-end or orphaned mates can still contribute.
+                    if self.tss_read == 'read1':
+                        reads1 = reads["reads1"] + reads["reads1u"]
+                    else:  # read2
+                        reads1 = reads["reads2"] + reads["reads2u"]
                     
                     # Filter reads based on gene tag and cell barcode
                     reads1 = [r for r in reads1 if r.has_tag('GX') and r.get_tag('GX') == geneid]
@@ -883,4 +896,3 @@ class get_TSS_count():
                 deduplicated_reads.append(r)
                 
         return deduplicated_reads
-
