@@ -265,8 +265,6 @@ class get_TSS_count():
 
         elif self.platform == 'smartseq5':
             # Smart-seq5 processing: process each BAM file separately
-            pool = multiprocessing.Pool(processes=self.nproc)
-            
             fastqFilePath = self.fastqFilePath
 
             # If GX tag exists, use it to discover expressed genes. Otherwise, fall back to
@@ -322,7 +320,8 @@ class get_TSS_count():
                             reads1 = self._deduplicate_by_coordinates(reads1, mergedf, geneid, self.dedup_method)
 
                         for r in reads1:
-                            pos = r.reference_start if not r.is_reverse else r.reference_end
+                            # Use the read 5' base coordinate.
+                            pos = r.reference_start if not r.is_reverse else (r.reference_end - 1)
                             all_gene_reads.append((pos, cell_id, r.cigarstring))
                     readinfodict[geneid] = all_gene_reads
             else:
@@ -332,13 +331,14 @@ class get_TSS_count():
 
                 for bam_file in self.bam_file_list:
                     cell_id = os.path.splitext(os.path.basename(bam_file))[0]
+                    seen = set()
                     with pysam.AlignmentFile(bam_file, 'rb') as bam:
                         for r in self._iter_tss_reads(bam, self.tss_read):
                             chrom = str(r.reference_name).replace('chr', '')
                             if chrom not in gene_idx:
                                 continue
-                            pos = r.reference_start if not r.is_reverse else r.reference_end
-                            hits = list(gene_idx[chrom].find_overlap(pos, pos + 1))
+                            five_prime = r.reference_start if not r.is_reverse else (r.reference_end - 1)
+                            hits = list(gene_idx[chrom].find_overlap(five_prime, five_prime + 1))
                             if not hits:
                                 continue
                             starts, ends, ids = gene_meta[chrom]
@@ -350,7 +350,27 @@ class get_TSS_count():
                                     best_len = glen
                                     best_i = i
                             geneid = ids[best_i]
-                            readinfodict.setdefault(geneid, []).append((pos, cell_id, r.cigarstring))
+                            # Apply deduplication in the same spirit as the Smart-seq5 path.
+                            if self.dedup_method in ('coord', 'fragment', 'umi'):
+                                if self.dedup_method == 'fragment':
+                                    if r.is_reverse:
+                                        frag_start = r.reference_end - 500
+                                        frag_end = r.reference_end
+                                    else:
+                                        frag_start = r.reference_start
+                                        frag_end = r.reference_start + 500
+                                    dedup_key = (chrom, frag_start, frag_end, r.is_reverse)
+                                else:
+                                    # coord (and umi fallback): (chrom, 5' pos, strand)
+                                    dedup_key = (chrom, five_prime, r.is_reverse)
+
+                                # Include gene/cell in the key so we don't collapse across genes.
+                                dedup_key = (cell_id, geneid) + dedup_key
+                                if dedup_key in seen:
+                                    continue
+                                seen.add(dedup_key)
+
+                            readinfodict.setdefault(geneid, []).append((five_prime, cell_id, r.cigarstring))
 
         #delete gene whose reads length is larger than maxReadCount
         for i in list(readinfodict.keys()):
@@ -524,6 +544,11 @@ class get_TSS_count():
 
         #do filtering, the result of this step should be output as final h5ad file display at single cell level. 
         afterfiltereddf=fourfeaturedf[test_Y==1]
+        if afterfiltereddf.shape[0] == 0:
+            # The pre-trained classifier can be too strict for non-10x libraries (e.g. Smart-seq+5').
+            # Fall back to keeping all clusters that passed the basic minCount threshold.
+            print("[CamoTSS] Warning: classifier filtered out all TSS clusters; falling back to keep all clusters.")
+            afterfiltereddf = fourfeaturedf.copy()
         afterfiltereddf.columns=['UMI_count','SD','summit_UMI_count','unencoded_G_percent','NO.TSS','gene_id','summit_position']
 
         afterfilter_output=self.count_out_dir+'afterfiltered.csv'
@@ -640,6 +665,15 @@ class get_TSS_count():
         print("hi , this is the start")
         ctime=time.time()
         extendls,regiondf=self._TSS_annotation()
+        if len(extendls) == 0:
+            # No TSS clusters survived filtering; write empty outputs for consistency.
+            empty = ad.AnnData(X=np.zeros((0, 0), dtype=np.float32))
+            sc_output_h5ad=self.count_out_dir+'scTSS_count_all.h5ad'
+            empty.write(sc_output_h5ad)
+            sc_output_h5ad=self.count_out_dir+'scTSS_count_two.h5ad'
+            empty.write(sc_output_h5ad)
+            print('produce h5ad Time elapsed',int(time.time()-ctime),'seconds.')
+            return empty
         #transcriptdfls=[]
 
         cellIDls=[]
