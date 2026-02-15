@@ -17,6 +17,12 @@ import warnings
 from pathlib import Path
 from .toolbox import check_pysam_chrom,fetch_reads
 
+try:
+    # pyranges depends on ncls and it's a lightweight way to do interval queries.
+    from ncls import NCLS
+except Exception:
+    NCLS = None
+
 
 
 
@@ -79,6 +85,67 @@ class get_TSS_count():
             self.bam_file_list = bamfilePath
         else:
             self.bam_file_list = [bamfilePath]
+
+    def _build_gene_interval_index(self):
+        """Build a per-chromosome interval index for gene assignment.
+
+        Smart-seq5 BAMs may not contain a gene tag (e.g. GX). In that case we assign
+        each read to a gene by genomic overlap with the gene interval from the GTF.
+        """
+        if NCLS is None:
+            raise RuntimeError("ncls is required for gene assignment fallback but is not available.")
+
+        df = self.generefdf[['gene_id', 'Chromosome', 'Start', 'End']].copy()
+        df = df.dropna(subset=['Chromosome'])
+        # Gene refs are stored without leading 'chr' (see build_ref.py), but be defensive.
+        df['Chromosome'] = df['Chromosome'].astype(str).str.replace(r'^chr', '', regex=True)
+        df['Start'] = df['Start'].astype(int)
+        df['End'] = df['End'].astype(int)
+
+        idx = {}
+        meta = {}
+        for chrom, g in df.groupby('Chromosome', sort=False):
+            g = g.sort_values('Start', kind='mergesort').reset_index(drop=True)
+            starts = g['Start'].to_numpy(dtype=np.int64, copy=True)
+            ends = g['End'].to_numpy(dtype=np.int64, copy=True)
+            ids = g['gene_id'].to_numpy(copy=True)
+            ok = ends > starts
+            starts = starts[ok]
+            ends = ends[ok]
+            ids = ids[ok]
+            if len(starts) == 0:
+                continue
+            idx[chrom] = NCLS(starts, ends, np.arange(len(starts), dtype=np.int64))
+            meta[chrom] = (starts, ends, ids)
+        return idx, meta
+
+    def _has_gene_tag(self, bam_path, tag='GX', max_reads=20000):
+        """Fast check whether a BAM carries the expected gene tag."""
+        try:
+            with pysam.AlignmentFile(bam_path, 'rb') as bam:
+                n = 0
+                for r in bam.fetch(until_eof=True):
+                    n += 1
+                    if r.has_tag(tag):
+                        return True
+                    if n >= max_reads:
+                        break
+        except Exception:
+            return False
+        return False
+
+    def _iter_tss_reads(self, bam, use_read):
+        """Yield alignments that correspond to the selected mate (read1 or read2)."""
+        for r in bam.fetch(until_eof=True):
+            if r.is_unmapped or r.is_secondary or r.is_duplicate or r.is_supplementary:
+                continue
+            if r.mapping_quality < self.min_mapq:
+                continue
+            if use_read == 'read1' and not r.is_read1:
+                continue
+            if use_read == 'read2' and not r.is_read2:
+                continue
+            yield r
 
         
 
@@ -201,80 +268,89 @@ class get_TSS_count():
             pool = multiprocessing.Pool(processes=self.nproc)
             
             fastqFilePath = self.fastqFilePath
-            
-            # Collect all genes across all BAM files
-            geneidls = []
-            for bam_file in self.bam_file_list:
-                getreadsFile = pysam.AlignmentFile(bam_file, 'rb')
-                for read in getreadsFile.fetch(until_eof=True):
-                    if read.has_tag('GX'):  # Assuming GX tag exists in smart-seq5 data
-                        geneid = read.get_tag('GX')
-                        geneidls.append(geneid)
-                getreadsFile.close()
-            
-            geneiddf = pd.DataFrame(geneidls, columns=['gene_id'])
-            print("hi , this is the gene id df from smartseq5")
 
-            geneid_uniqdf = geneiddf.drop_duplicates('gene_id')
-            print(geneiddf)
-            print("hi, this is the gene refdf")
-            print(self.generefdf)
+            # If GX tag exists, use it to discover expressed genes. Otherwise, fall back to
+            # overlap-based assignment using gene intervals from the GTF.
+            has_gx = any(self._has_gene_tag(b) for b in self.bam_file_list)
 
-            mergedf = geneid_uniqdf.merge(self.generefdf, on='gene_id')
-            mergedf.set_index('gene_id', inplace=True)
-            print("hi, this is the merge df")
-            print(mergedf)
+            if has_gx:
+                geneidls = []
+                for bam_file in self.bam_file_list:
+                    getreadsFile = pysam.AlignmentFile(bam_file, 'rb')
+                    for read in getreadsFile.fetch(until_eof=True):
+                        if read.has_tag('GX'):
+                            geneidls.append(read.get_tag('GX'))
+                    getreadsFile.close()
 
-            readinfodict = {}
-            
-            # Process each gene across all BAM files
-            for geneid in mergedf.index:
-                print(f"Processing gene: {geneid}")
-                
-                # Collect reads for this gene from all BAM files
-                all_gene_reads = []
-                for bam_idx, bam_file in enumerate(self.bam_file_list):
-                    cell_id = os.path.splitext(os.path.basename(bam_file))[0]  # Use BAM filename as cell ID
-                    
-                    # Get reads for this gene from this specific BAM file
-                    samFile, _chrom = check_pysam_chrom(bam_file, str(mergedf.loc[geneid]['Chromosome']))
-                    
-                    # Fetch reads in gene region
-                    reads = fetch_reads(samFile, _chrom, 
-                                      mergedf.loc[geneid]['Start'], 
-                                      mergedf.loc[geneid]['End'], 
-                                      trimLen_max=100, 
-                                      mapq_min=self.min_mapq)
-                    # Select the mate that carries 5' transcript information.
-                    # Include both mated and unmated reads so single-end or orphaned mates can still contribute.
-                    if self.tss_read == 'read1':
-                        reads1 = reads["reads1"] + reads["reads1u"]
-                    else:  # read2
-                        reads1 = reads["reads2"] + reads["reads2u"]
-                    
-                    # Filter reads based on gene tag and cell barcode
-                    reads1 = [r for r in reads1 if r.has_tag('GX') and r.get_tag('GX') == geneid]
-                    
-                    # Apply deduplication based on method
-                    if self.dedup_method == 'umi':
-                        # Original UMI-based deduplication
-                        reads1 = self._deduplicate_by_umi(reads1, mergedf, geneid)
-                    elif self.dedup_method in ['coord', 'fragment']:
-                        # Coordinate or fragment-based deduplication for smart-seq5
-                        reads1 = self._deduplicate_by_coordinates(reads1, mergedf, geneid, self.dedup_method)
-                    elif self.dedup_method == 'none':
-                        # No deduplication
-                        pass
-                    
-                    # Convert to the format expected by downstream functions
-                    for r in reads1:
-                        if mergedf.loc[geneid]['Strand'] == '+':
-                            pos = r.reference_start
-                        else:  # '-'
-                            pos = r.reference_end
-                        all_gene_reads.append((pos, cell_id, r.cigarstring))
-                
-                readinfodict[geneid] = all_gene_reads
+                geneiddf = pd.DataFrame(geneidls, columns=['gene_id'])
+                print("hi , this is the gene id df from smartseq5")
+
+                geneid_uniqdf = geneiddf.drop_duplicates('gene_id')
+                print(geneiddf)
+                print("hi, this is the gene refdf")
+                print(self.generefdf)
+
+                mergedf = geneid_uniqdf.merge(self.generefdf, on='gene_id')
+                mergedf.set_index('gene_id', inplace=True)
+                print("hi, this is the merge df")
+                print(mergedf)
+
+                readinfodict = {}
+                for geneid in mergedf.index:
+                    print(f"Processing gene: {geneid}")
+                    all_gene_reads = []
+                    for bam_file in self.bam_file_list:
+                        cell_id = os.path.splitext(os.path.basename(bam_file))[0]
+                        samFile, _chrom = check_pysam_chrom(bam_file, str(mergedf.loc[geneid]['Chromosome']))
+                        reads = fetch_reads(
+                            samFile, _chrom,
+                            mergedf.loc[geneid]['Start'],
+                            mergedf.loc[geneid]['End'],
+                            trimLen_max=100,
+                            mapq_min=self.min_mapq
+                        )
+                        if self.tss_read == 'read1':
+                            reads1 = reads["reads1"] + reads["reads1u"]
+                        else:
+                            reads1 = reads["reads2"] + reads["reads2u"]
+
+                        reads1 = [r for r in reads1 if r.has_tag('GX') and r.get_tag('GX') == geneid]
+
+                        if self.dedup_method == 'umi':
+                            reads1 = self._deduplicate_by_umi(reads1, mergedf, geneid)
+                        elif self.dedup_method in ['coord', 'fragment']:
+                            reads1 = self._deduplicate_by_coordinates(reads1, mergedf, geneid, self.dedup_method)
+
+                        for r in reads1:
+                            pos = r.reference_start if not r.is_reverse else r.reference_end
+                            all_gene_reads.append((pos, cell_id, r.cigarstring))
+                    readinfodict[geneid] = all_gene_reads
+            else:
+                print("[CamoTSS][smartseq5] BAMs do not contain GX tags; using overlap-based gene assignment.")
+                gene_idx, gene_meta = self._build_gene_interval_index()
+                readinfodict = {}
+
+                for bam_file in self.bam_file_list:
+                    cell_id = os.path.splitext(os.path.basename(bam_file))[0]
+                    with pysam.AlignmentFile(bam_file, 'rb') as bam:
+                        for r in self._iter_tss_reads(bam, self.tss_read):
+                            chrom = str(r.reference_name).replace('chr', '')
+                            if chrom not in gene_idx:
+                                continue
+                            pos = r.reference_start if not r.is_reverse else r.reference_end
+                            hits = list(gene_idx[chrom].find_overlap(pos, pos + 1))
+                            if not hits:
+                                continue
+                            starts, ends, ids = gene_meta[chrom]
+                            best_i = None
+                            best_len = None
+                            for _s, _e, i in hits:
+                                glen = int(ends[i] - starts[i])
+                                if best_len is None or glen < best_len:
+                                    best_len = glen
+                                    best_i = i
+                            geneid = ids[best_i]
+                            readinfodict.setdefault(geneid, []).append((pos, cell_id, r.cigarstring))
 
         #delete gene whose reads length is larger than maxReadCount
         for i in list(readinfodict.keys()):
@@ -396,7 +472,9 @@ class get_TSS_count():
                 
 
                 count=len(altTSSdict[i][j][0])
-                std=statistics.stdev(altTSSdict[i][j][0].flatten())
+                # statistics.stdev() doesn't accept numpy scalars reliably; use numpy directly.
+                flat = altTSSdict[i][j][0].flatten()
+                std = float(np.std(flat, ddof=1)) if len(flat) > 1 else 0.0
                 summit_count=np.max(np.unique(altTSSdict[i][j][0].flatten(),return_counts=True)[1])
                 unencoded_G_percent=sum([('14S' in ele)or('15S' in ele)or('16S' in ele) for ele in altTSSdict[i][j][2].flatten()])/count
                 
@@ -413,7 +491,16 @@ class get_TSS_count():
         # with open(cluster_output,'wb') as f:
         #     pickle.dump(clusterdict,f)
 
-        
+        if len(clusterdict) == 0:
+            # No clusters survived; write empty artifacts and return empty keepdict.
+            empty = pd.DataFrame(columns=['UMI_count','SD','summit_UMI_count','unencoded_G_percent','NO.TSS','gene_id','summit_position'])
+            empty.to_csv(self.count_out_dir+'fourFeature.csv', index=False)
+            empty.to_csv(self.count_out_dir+'afterfiltered.csv', index=False)
+            tss_output=self.count_out_dir+'keepdict.pkl'
+            with open(tss_output,'wb') as f:
+                pickle.dump({},f)
+            return {}
+
         fourfeaturedf=pd.DataFrame(clusterdict).T 
         fourfeaturedf.columns=['UMI_count','SD','summit_UMI_count','unencoded_G_percent','NO.TSS','gene_id','summit_position']
         fourfeature_output=self.count_out_dir+'fourFeature.csv'
@@ -593,6 +680,14 @@ class get_TSS_count():
         geneID=selectedf['gene_id'].unique()
 
         keepdfls=[]
+        if len(geneID) == 0:
+            # No genes with >=2 TSS clusters; still write an empty "two" matrix for consistency.
+            finaltwoadata = adata[:, []]
+            sc_output_h5ad=self.count_out_dir+'scTSS_count_two.h5ad'
+            finaltwoadata.write(sc_output_h5ad)
+            print('produce h5ad Time elapsed',int(time.time()-ctime),'seconds.')
+            return adata
+
         for i in geneID:
             tempdf=selectedf[selectedf['gene_id']==i]
 
@@ -768,6 +863,16 @@ class get_TSS_count():
                 cellIDdict[newid]=cellIDls
 
         #print(len(cellIDdict))
+
+        if len(cellIDdict) == 0:
+            # No CTSS passed thresholds; write empty outputs for consistency.
+            ctssadata = ad.AnnData(X=np.zeros((0, 0), dtype=np.float32))
+            ctss_output_h5ad=self.ctss_out_dir+'all_ctss.h5ad'
+            ctssadata.write(ctss_output_h5ad)
+            sc_output_h5ad=self.ctss_out_dir+'all_ctss_two.h5ad'
+            ctssadata.write(sc_output_h5ad)
+            print('produce CTSS h5ad Time elapsed',int(time.time()-ctime),'seconds.')
+            return ctssadata
 
 
         #create a big matrix including cell ID

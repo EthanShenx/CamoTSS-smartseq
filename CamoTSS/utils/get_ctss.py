@@ -180,6 +180,16 @@ class get_CTSS_count():
 
         #print(len(cellIDdict))
 
+        if len(cellIDdict) == 0:
+            # No CTSS passed thresholds; write empty outputs for consistency.
+            ctssadata = ad.AnnData(X=np.zeros((0, 0), dtype=np.float32))
+            ctss_output_h5ad=self.ctss_out_dir+'all_ctss.h5ad'
+            ctssadata.write(ctss_output_h5ad)
+            sc_output_h5ad=self.ctss_out_dir+'all_ctss_two.h5ad'
+            ctssadata.write(sc_output_h5ad)
+            print('produce CTSS h5ad Time elapsed',int(time.time()-ctime),'seconds.')
+            return ctssadata
+
 
         #create a big matrix including cell ID
         cellidls=list(cellIDdict.values())
